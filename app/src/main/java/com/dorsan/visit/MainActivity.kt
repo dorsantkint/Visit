@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -52,7 +54,10 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     Column(
-                        modifier = Modifier.fillMaxSize().padding(24.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(24.dp)
+                            .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.Center
                     ) {
                         Text(text = "Visit — POC hackathon")
@@ -72,7 +77,24 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }) {
-                            Text("2. Activer les points de test")
+                            Text("2. Activer les points de test (réel, par géoloc)")
+                        }
+
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Text(text = "3. Tester sans marcher (simulation) :")
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Un bouton par POI : déclenche directement la notification (et donc
+                        // la lecture vocale au tap) sans passer par le GPS. Pratique pour
+                        // tester l'UI, la notif et le TTS où que tu sois.
+                        PoiRepository.testPois.forEach { poi ->
+                            Button(onClick = {
+                                NotificationHelper(this@MainActivity).showPoiNotification(poi)
+                                statusText = "Notification simulée pour : ${poi.name}"
+                            }) {
+                                Text("Simuler l'arrivée : ${poi.name}")
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
                     }
                 }
