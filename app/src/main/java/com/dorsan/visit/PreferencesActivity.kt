@@ -22,6 +22,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -78,6 +79,11 @@ fun PreferencesScreen() {
     var durationMin by remember { mutableStateOf(2) }
     var triggerRadiusM by remember { mutableStateOf(40) }
     var previewJson by remember { mutableStateOf<String?>(null) }
+
+    var backendUrl by remember { mutableStateOf("http://192.168.1.42:8000") }
+    var isLoading by remember { mutableStateOf(false) }
+    var resultSummary by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
 
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -176,6 +182,21 @@ fun PreferencesScreen() {
                 }
                 Spacer(Modifier.height(24.dp))
 
+                Text("Adresse du backend", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Ton PC et ce téléphone doivent être sur le même Wi-Fi. Trouve l'IP de ton PC avec " +
+                        "\"ipconfig\" dans PowerShell (Adresse IPv4).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = backendUrl,
+                    onValueChange = { backendUrl = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Spacer(Modifier.height(24.dp))
+
                 Button(
                     onClick = {
                         val languages = buildSet {
@@ -204,6 +225,67 @@ fun PreferencesScreen() {
                     Text("Ceci sera envoyé à /generate-tour :", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(4.dp))
                     Text(json, style = MaterialTheme.typography.bodySmall)
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                Button(
+                    enabled = lat != null && lon != null && !isLoading,
+                    onClick = {
+                        val languages = buildSet {
+                            if (frSelected) add("fr")
+                            if (enSelected) add("en")
+                        }
+                        val prefs = TourPreferences(
+                            lat = lat,
+                            lon = lon,
+                            radiusM = radiusM.toInt(),
+                            poiTypes = selectedTypes,
+                            nbPoi = nbPoi.toInt(),
+                            languages = languages,
+                            durationMin = durationMin,
+                            triggerRadiusM = triggerRadiusM
+                        )
+
+                        isLoading = true
+                        errorMessage = null
+                        resultSummary = null
+
+                        BackendClient.generateTour(
+                            baseUrl = backendUrl.trimEnd('/'),
+                            requestJson = prefs.toRequestJson(),
+                            onSuccess = { json ->
+                                isLoading = false
+                                val pois = json.getJSONArray("pois")
+                                val intro = json.getJSONArray("intro")
+                                resultSummary = "${pois.length()} POI reçu(s)" +
+                                    if (intro.length() > 0) " + anecdote de quartier reçue." else "."
+                            },
+                            onError = { message ->
+                                isLoading = false
+                                errorMessage = message
+                            }
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        when {
+                            isLoading -> "Génération en cours (peut prendre plusieurs minutes)..."
+                            lat == null || lon == null -> "Définis d'abord une position"
+                            else -> "Envoyer au backend"
+                        }
+                    )
+                }
+
+                resultSummary?.let { summary ->
+                    Spacer(Modifier.height(16.dp))
+                    Text("Résultat : $summary")
+                }
+
+                errorMessage?.let { error ->
+                    Spacer(Modifier.height(16.dp))
+                    Text("Erreur : $error")
                 }
             }
         }
