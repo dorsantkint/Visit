@@ -1,0 +1,9 @@
+À AJOUTER dans app/build.gradle.kts, dans le bloc dependencies { ... } déjà présent
+(ne touche pas au reste, ajoute juste cette ligne) :
+
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+
+Puis clique sur "Sync Now" dans la bannière qui apparaît en haut du fichier.
+
+Si Android Studio te propose une version plus récente au moment où tu fais ça,
+prends la version proposée par défaut par l'IDE — pas besoin de forcer 21.3.0.

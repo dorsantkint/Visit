@@ -1,0 +1,28 @@
+<!--
+  À AJOUTER dans app/src/main/AndroidManifest.xml
+  (fichier généré par Android Studio - ne pas remplacer, juste compléter)
+-->
+
+<!-- 1) Juste avant la balise <application ...> : -->
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+<!--
+  2) À L'INTÉRIEUR de la balise <application ...> ... </application>,
+  juste après la balise <activity> de MainActivity qui existe déjà :
+-->
+<receiver
+    android:name=".GeofenceBroadcastReceiver"
+    android:exported="true" />
+
+<activity
+    android:name=".TtsReaderActivity"
+    android:exported="false"
+    android:theme="@style/Theme.Visit" />
+<!--
+  IMPORTANT : remplace "Theme.Visit" par le nom réel de ton thème.
+  Il est visible en haut du fichier app/src/main/res/values/themes.xml,
+  généralement "Theme.<NomDeTonProjet>".
+-->
