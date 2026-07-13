@@ -1,6 +1,7 @@
 package com.dorsan.visit
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -96,6 +97,15 @@ class MainActivity : ComponentActivity() {
                             }
                             Spacer(modifier = Modifier.height(8.dp))
                         }
+
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Text(text = "4. Configurer une vraie visite (backend IA) :")
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(onClick = {
+                            startActivity(Intent(this@MainActivity, PreferencesActivity::class.java))
+                        }) {
+                            Text("Ouvrir les préférences de visite")
+                        }
                     }
                 }
             }
@@ -113,3 +123,4 @@ class MainActivity : ComponentActivity() {
         requestPermissions.launch(permissions.toTypedArray())
     }
 }
+
