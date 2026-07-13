@@ -40,8 +40,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        CrashHandler.install(this)
+        val lastCrash = CrashHandler.readLastCrash(this)
+
         setContent {
             var statusText by remember { mutableStateOf("Prêt") }
+            var crashText by remember { mutableStateOf(lastCrash) }
 
             onPermissionsResult = { results ->
                 val denied = results.filterValues { granted -> !granted }.keys
@@ -64,6 +68,21 @@ class MainActivity : ComponentActivity() {
                         Text(text = "Visit — POC hackathon")
                         Spacer(modifier = Modifier.height(16.dp))
                         Text(text = statusText)
+
+                        crashText?.let { crash ->
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(text = "Dernier crash détecté :")
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(text = crash)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(onClick = {
+                                CrashHandler.clearLastCrash(this@MainActivity)
+                                crashText = null
+                            }) {
+                                Text("Effacer ce message")
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(24.dp))
                         Button(onClick = { requestNeededPermissions() }) {
                             Text("1. Demander les permissions")
@@ -123,4 +142,3 @@ class MainActivity : ComponentActivity() {
         requestPermissions.launch(permissions.toTypedArray())
     }
 }
-
