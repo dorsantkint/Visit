@@ -1,9 +1,13 @@
 package com.dorsan.visit
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -50,6 +54,22 @@ fun PreferencesScreen() {
     var lon by remember { mutableStateOf<Double?>(null) }
     var locationStatus by remember { mutableStateOf("Position non définie") }
 
+    val mapPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            result.data?.let { data ->
+                val pickedLat = data.getDoubleExtra("lat", Double.NaN)
+                val pickedLon = data.getDoubleExtra("lon", Double.NaN)
+                if (!pickedLat.isNaN() && !pickedLon.isNaN()) {
+                    lat = pickedLat
+                    lon = pickedLon
+                    locationStatus = "Position : %.5f, %.5f".format(pickedLat, pickedLon)
+                }
+            }
+        }
+    }
+
     var radiusM by remember { mutableStateOf(500f) }
     var selectedTypes by remember { mutableStateOf(setOf("monument", "historic")) }
     var nbPoi by remember { mutableStateOf(5f) }
@@ -85,6 +105,16 @@ fun PreferencesScreen() {
                     }
                 }) {
                     Text("Utiliser ma position actuelle")
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = {
+                    val intent = Intent(context, MapPickerActivity::class.java).apply {
+                        putExtra("start_lat", lat ?: 50.8503)
+                        putExtra("start_lon", lon ?: 4.3517)
+                    }
+                    mapPickerLauncher.launch(intent)
+                }) {
+                    Text("Choisir sur la carte")
                 }
                 Spacer(Modifier.height(24.dp))
 
