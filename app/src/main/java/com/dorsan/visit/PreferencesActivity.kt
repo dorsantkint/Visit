@@ -84,6 +84,7 @@ fun PreferencesScreen() {
     var isLoading by remember { mutableStateOf(false) }
     var resultSummary by remember { mutableStateOf<String?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var tourJson by remember { mutableStateOf<String?>(null) }
 
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -250,6 +251,7 @@ fun PreferencesScreen() {
                         isLoading = true
                         errorMessage = null
                         resultSummary = null
+                        tourJson = null
 
                         BackendClient.generateTour(
                             baseUrl = backendUrl.trimEnd('/'),
@@ -260,6 +262,7 @@ fun PreferencesScreen() {
                                 val intro = json.getJSONArray("intro")
                                 resultSummary = "${pois.length()} POI reçu(s)" +
                                     if (intro.length() > 0) " + anecdote de quartier reçue." else "."
+                                tourJson = json.toString()
                             },
                             onError = { message ->
                                 isLoading = false
@@ -281,6 +284,21 @@ fun PreferencesScreen() {
                 resultSummary?.let { summary ->
                     Spacer(Modifier.height(16.dp))
                     Text("Résultat : $summary")
+                }
+
+                tourJson?.let { json ->
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            val intent = Intent(context, ResultsActivity::class.java).apply {
+                                putExtra("tour_json", json)
+                            }
+                            context.startActivity(intent)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Voir les résultats")
+                    }
                 }
 
                 errorMessage?.let { error ->
