@@ -125,6 +125,13 @@ class MainActivity : ComponentActivity() {
                         }) {
                             Text("Ouvrir les préférences de visite")
                         }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(onClick = {
+                            startActivity(Intent(this@MainActivity, SessionsActivity::class.java))
+                        }) {
+                            Text("Mes sessions sauvegardées")
+                        }
                     }
                 }
             }
