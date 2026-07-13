@@ -1,0 +1,181 @@
+package com.dorsan.visit
+
+import android.annotation.SuppressLint
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import com.google.android.gms.location.LocationServices
+
+class PreferencesActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            PreferencesScreen()
+        }
+    }
+}
+
+@SuppressLint("MissingPermission") // permission déjà demandée depuis MainActivity
+@Composable
+fun PreferencesScreen() {
+    val context = LocalContext.current
+
+    var lat by remember { mutableStateOf<Double?>(null) }
+    var lon by remember { mutableStateOf<Double?>(null) }
+    var locationStatus by remember { mutableStateOf("Position non définie") }
+
+    var radiusM by remember { mutableStateOf(500f) }
+    var selectedTypes by remember { mutableStateOf(setOf("monument", "historic")) }
+    var nbPoi by remember { mutableStateOf(5f) }
+    var frSelected by remember { mutableStateOf(true) }
+    var enSelected by remember { mutableStateOf(false) }
+    var durationMin by remember { mutableStateOf(2) }
+    var triggerRadiusM by remember { mutableStateOf(40) }
+    var previewJson by remember { mutableStateOf<String?>(null) }
+
+    MaterialTheme {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(24.dp)
+            ) {
+                Text("Préférences de visite", style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(16.dp))
+
+                Text(locationStatus)
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = {
+                    val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+                    fusedLocationClient.lastLocation.addOnSuccessListener { location ->
+                        if (location != null) {
+                            lat = location.latitude
+                            lon = location.longitude
+                            locationStatus = "Position : %.5f, %.5f".format(location.latitude, location.longitude)
+                        } else {
+                            locationStatus = "Position indisponible (active le GPS et réessaie)"
+                        }
+                    }
+                }) {
+                    Text("Utiliser ma position actuelle")
+                }
+                Spacer(Modifier.height(24.dp))
+
+                Text("Rayon de recherche : ${radiusM.toInt()} m")
+                Slider(value = radiusM, onValueChange = { radiusM = it }, valueRange = 50f..2000f)
+                Spacer(Modifier.height(16.dp))
+
+                Text("Types de points d'intérêt", style = MaterialTheme.typography.titleMedium)
+                AVAILABLE_POI_TYPES.forEach { option ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = option.key in selectedTypes,
+                            onCheckedChange = { checked ->
+                                selectedTypes = if (checked) selectedTypes + option.key else selectedTypes - option.key
+                            }
+                        )
+                        Text(option.label)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+
+                Text("Nombre de points : ${nbPoi.toInt()}")
+                Slider(value = nbPoi, onValueChange = { nbPoi = it }, valueRange = 1f..20f, steps = 18)
+                Spacer(Modifier.height(16.dp))
+
+                Text("Langue(s)", style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = frSelected, onCheckedChange = { frSelected = it })
+                    Text("Français")
+                    Spacer(Modifier.width(16.dp))
+                    Checkbox(checked = enSelected, onCheckedChange = { enSelected = it })
+                    Text("English")
+                }
+                Spacer(Modifier.height(16.dp))
+
+                Text("Durée de lecture par description", style = MaterialTheme.typography.titleMedium)
+                Row {
+                    (1..5).forEach { minute ->
+                        FilterChip(
+                            selected = durationMin == minute,
+                            onClick = { durationMin = minute },
+                            label = { Text("$minute min") },
+                            modifier = Modifier.padding(end = 8.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+
+                Text("Zone de déclenchement", style = MaterialTheme.typography.titleMedium)
+                Row {
+                    listOf(20, 40, 60).forEach { radius ->
+                        FilterChip(
+                            selected = triggerRadiusM == radius,
+                            onClick = { triggerRadiusM = radius },
+                            label = { Text("$radius m") },
+                            modifier = Modifier.padding(end = 8.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
+
+                Button(
+                    onClick = {
+                        val languages = buildSet {
+                            if (frSelected) add("fr")
+                            if (enSelected) add("en")
+                        }
+                        val prefs = TourPreferences(
+                            lat = lat,
+                            lon = lon,
+                            radiusM = radiusM.toInt(),
+                            poiTypes = selectedTypes,
+                            nbPoi = nbPoi.toInt(),
+                            languages = languages,
+                            durationMin = durationMin,
+                            triggerRadiusM = triggerRadiusM
+                        )
+                        previewJson = prefs.toRequestJson()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Aperçu de la requête")
+                }
+
+                previewJson?.let { json ->
+                    Spacer(Modifier.height(16.dp))
+                    Text("Ceci sera envoyé à /generate-tour :", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Text(json, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    }
+}
