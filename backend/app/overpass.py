@@ -1,6 +1,7 @@
 """Récupération des POI bruts d'une zone via l'API Overpass (données OpenStreetMap, gratuit)."""
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -132,6 +133,33 @@ _SECONDARY_QUERY_TIMEOUT = 8
 DEFAULT_RAW_POI_LIMIT = 200
 
 
+def _fetch_fragment(
+    lat: float, lon: float, radius_m: int, elem_type: str, tag_filter: str, limit: int
+) -> List[Dict[str, Any]]:
+    """Exécute UN SEUL fragment de recherche (un type d'élément + un filtre de tag),
+    plutôt que de le fusionner dans la requête combinée habituelle. Sert uniquement à
+    mesurer précisément le temps de CHAQUE filtre pris isolément (voir fetch_pois) — sans
+    ça, on ne voit qu'un temps total agrégé et on doit deviner quel filtre est en cause.
+
+    Une panne réseau sur un fragment ne fait pas échouer les autres : on log l'échec et
+    on renvoie une liste vide pour celui-là, comme un simple "0 résultat" pour ce filtre."""
+    query = f"""
+    [out:json][timeout:30];
+    {elem_type}{tag_filter}(around:{radius_m},{lat},{lon});
+    out center {limit};
+    """
+    label = f"{elem_type}{tag_filter}"
+    started_at = time.perf_counter()
+    try:
+        data = _query_overpass(query)
+        elements = data.get("elements", [])
+        print(f"[timing][overpass-fragment] {label} : {time.perf_counter() - started_at:.2f}s ({len(elements)} éléments)")
+        return elements
+    except requests.RequestException as exc:
+        print(f"[timing][overpass-fragment] {label} : ÉCHEC après {time.perf_counter() - started_at:.2f}s ({exc})")
+        return []
+
+
 def fetch_pois(
     lat: float, lon: float, radius_m: int, poi_types: List[str], limit: int = DEFAULT_RAW_POI_LIMIT
 ) -> List[Dict[str, Any]]:
@@ -142,27 +170,34 @@ def fetch_pois(
     if not filters:
         filters = [("nw", '["historic"]')]
 
-    # "nw" est développé en deux statements séparés (node + way), syntaxe Overpass
+    # "nw" est développé en deux fragments séparés (node + way), syntaxe Overpass
     # garantie standard, plutôt que de parier sur un raccourci combiné.
-    statements: List[str] = []
+    fragments: List[Tuple[str, str]] = []
     for elem_type, tag_filter in filters:
         elem_types = ("node", "way") if elem_type == "nw" else (elem_type,)
         for et in elem_types:
-            statements.append(f"{et}{tag_filter}(around:{radius_m},{lat},{lon});")
+            fragments.append((et, tag_filter))
 
-    union_parts = "\n      ".join(statements)
-    query = f"""
-    [out:json][timeout:30];
-    (
-      {union_parts}
-    );
-    out center {limit};
-    """
-
-    data = _query_overpass(query)
+    # Étape de diagnostic (temporaire, demandée explicitement) : chaque fragment part
+    # dans SA PROPRE requête Overpass, en parallèle, plutôt que fusionnés en une seule
+    # requête combinée comme avant. Ça permet de voir dans les logs quel filtre précis
+    # est lent pour un type de POI donné, plutôt qu'un seul temps total agrégé. En
+    # parallèle pour ne pas payer la somme de tous les fragments un par un.
+    raw_elements_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(fragments))) as executor:
+        futures = [
+            executor.submit(_fetch_fragment, lat, lon, radius_m, et, tag_filter, limit)
+            for et, tag_filter in fragments
+        ]
+        for future in futures:
+            for el in future.result():
+                # Un même élément peut être retrouvé par plusieurs fragments (ex: un
+                # nœud avec à la fois wikidata et wikipedia) — dédoublonné ici puisque
+                # ce n'est plus fait automatiquement par un seul bloc "union" Overpass.
+                raw_elements_by_key[(el["type"], el["id"])] = el
 
     pois: List[Dict[str, Any]] = []
-    for el in data.get("elements", []):
+    for el in raw_elements_by_key.values():
         tags = el.get("tags", {})
         name = tags.get("name")
         if not name:
