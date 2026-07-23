@@ -1,7 +1,6 @@
 """Récupération des POI bruts d'une zone via l'API Overpass (données OpenStreetMap, gratuit)."""
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -28,26 +27,34 @@ _HEADERS = {
 #     toujours cartographié comme un point : œuvre d'art, point de vue, restaurant...)
 #   - "nw"    : cherche aussi les polygones (bâtiments), pour ne pas rater des lieux
 #     emblématiques cartographiés comme un contour plutôt qu'un point simple (ex: un
-#     hôtel de ville, une église). Plus coûteux (mesuré : résoudre la géométrie d'un
-#     "way" peut prendre 10x plus de temps qu'un "node" équivalent), donc réservé aux
-#     catégories qui en ont vraiment besoin.
+#     hôtel de ville, une église). Plus coûteux, donc réservé aux catégories qui en
+#     ont vraiment besoin.
 # Volontairement PAS "nwr" (qui inclurait aussi les "relations") : dans un centre
 # historique dense, résoudre la géométrie de grosses relations (ex: l'ensemble classé
 # "Grand-Place") peut à lui seul saturer le délai de la requête et faire échouer la
 # recherche des bâtiments individuels qu'on veut justement trouver.
-#
-# Uniquement des tags de CATÉGORIE ici (ce que le lieu EST physiquement). Les tags de
-# NOTORIÉTÉ/DOCUMENTATION (wikidata, wikipedia, heritage, tourism=attraction) sont
-# volontairement séparés dans _QUALITY_SIGNAL_FRAGMENTS ci-dessous : un tag wikidata ne
-# dit jamais "c'est un monument", juste "quelqu'un a documenté ce lieu quelque part" —
-# ce signal peut s'appliquer à n'importe quelle catégorie, pas seulement aux monuments.
 TYPE_TAG_MAP: Dict[str, List[Tuple[str, str]]] = {
     "monument": [
         ("nw", '["historic"]'),
         ("nw", '["amenity"="townhall"]'),
+        ("nw", '["heritage"]'),
+        # "wikidata", "wikipedia" et "tourism=attraction" restent en recherche "node"
+        # seule : en "way" (bâtiments), ces tags sont bien trop répandus dans un centre
+        # historique dense (ça touche énormément de choses, pas seulement les bâtiments
+        # notables) et ont fait dépasser le budget temps d'Overpass, avec pour résultat
+        # des requêtes qui échouent entièrement (0 résultat) après avoir épuisé les 3
+        # mirrors. On accepte de rater ainsi un bâtiment qui n'aurait NI tag
+        # historic/heritage/townhall NI présence en tant que node, plutôt que de
+        # risquer de tout faire échouer.
+        ("node", '["wikidata"]'),
+        ("node", '["wikipedia"]'),
+        ("node", '["tourism"="attraction"]'),
     ],
     "historic": [
         ("nw", '["historic"]'),
+        ("nw", '["heritage"]'),
+        ("node", '["wikidata"]'),
+        ("node", '["wikipedia"]'),
     ],
     "artwork": [("node", '["tourism"="artwork"]')],
     "street_art": [("node", '["tourism"="artwork"]["artwork_type"~"mural|graffiti|stencil|street_art"]')],
@@ -56,25 +63,6 @@ TYPE_TAG_MAP: Dict[str, List[Tuple[str, str]]] = {
     "religious": [("nw", '["amenity"="place_of_worship"]')],
     "gastronomie": [("node", '["amenity"~"restaurant|cafe|bar"]')],
 }
-
-# Signaux de notoriété/documentation, partagés une seule fois pour toute la requête
-# (au lieu d'être dupliqués et incohérents entre définitions de types comme avant : eux
-# n'étaient présents QUE pour "monument"/"historic", jamais pour "religious" ou
-# "artwork", alors qu'une église ou une sculpture bien documentée mérite tout autant
-# ce signal). "heritage" reste "nw" (un statut patrimonial peut être posé sur un
-# bâtiment entier), les autres restent "node" (trop répandus en "way" dans un centre
-# dense, déjà observé comme cause de timeout par le passé).
-_QUALITY_SIGNAL_FRAGMENTS: List[Tuple[str, str]] = [
-    ("node", '["wikidata"]'),
-    ("node", '["wikipedia"]'),
-    ("nw", '["heritage"]'),
-    ("node", '["tourism"="attraction"]'),
-]
-
-# Types pour lesquels les signaux de notoriété ci-dessus ont un intérêt. Volontairement
-# PAS "gastronomie" seul : qu'un café ait une fiche Wikidata ne le rend pas plus
-# pertinent pour une demande de gastronomie, et ça ajouterait une recherche pour rien.
-_LANDMARK_STYLE_TYPES = {"monument", "historic", "artwork", "street_art", "museum", "viewpoint", "religious"}
 
 # Catégories "commerce alimentaire" : si l'utilisateur n'a pas coché "gastronomie", on
 # les exclut systématiquement du résultat — même si un café/bar/resto a été remonté par
@@ -144,19 +132,25 @@ _SECONDARY_QUERY_TIMEOUT = 8
 DEFAULT_RAW_POI_LIMIT = 200
 
 
-def _fetch_group(
-    lat: float, lon: float, radius_m: int, elem_type: str, tag_filters: List[str], limit: int
+def fetch_pois(
+    lat: float, lon: float, radius_m: int, poi_types: List[str], limit: int = DEFAULT_RAW_POI_LIMIT
 ) -> List[Dict[str, Any]]:
-    """Exécute UNE requête Overpass combinant tous les filtres d'un même type d'élément
-    (tous les "node" ensemble, ou tous les "way" ensemble) — pas une requête par filtre.
+    filters: List[Tuple[str, str]] = [
+        f for t in poi_types if t in TYPE_TAG_MAP for f in TYPE_TAG_MAP[t]
+    ]
+    filters = list(dict.fromkeys(filters))  # dédoublonne en gardant l'ordre
+    if not filters:
+        filters = [("nw", '["historic"]')]
 
-    Un diagnostic précédent (voir historique) a montré qu'envoyer une requête séparée
-    par filtre (jusqu'à 9 requêtes en parallèle) ralentissait TOUT, probablement à cause
-    d'une limite de connexions simultanées par client sur les mirrors publics — au lieu
-    d'accélérer, ça faisait attendre en file la moitié des requêtes. Regrouper par type
-    d'élément (node/way) garde au plus 2 requêtes en parallèle, ce qui reste raisonnable,
-    tout en gardant une mesure séparée node vs way (l'info utile du diagnostic)."""
-    union_parts = "\n      ".join(f"{elem_type}{tf}(around:{radius_m},{lat},{lon});" for tf in tag_filters)
+    # "nw" est développé en deux statements séparés (node + way), syntaxe Overpass
+    # garantie standard, plutôt que de parier sur un raccourci combiné.
+    statements: List[str] = []
+    for elem_type, tag_filter in filters:
+        elem_types = ("node", "way") if elem_type == "nw" else (elem_type,)
+        for et in elem_types:
+            statements.append(f"{et}{tag_filter}(around:{radius_m},{lat},{lon});")
+
+    union_parts = "\n      ".join(statements)
     query = f"""
     [out:json][timeout:30];
     (
@@ -164,57 +158,11 @@ def _fetch_group(
     );
     out center {limit};
     """
-    label = f"{elem_type} ({len(tag_filters)} filtre(s))"
-    started_at = time.perf_counter()
-    try:
-        data = _query_overpass(query)
-        elements = data.get("elements", [])
-        print(f"[timing][overpass-group] {label} : {time.perf_counter() - started_at:.2f}s ({len(elements)} éléments)")
-        return elements
-    except requests.RequestException as exc:
-        print(f"[timing][overpass-group] {label} : ÉCHEC après {time.perf_counter() - started_at:.2f}s ({exc})")
-        return []
 
-
-def fetch_pois(
-    lat: float, lon: float, radius_m: int, poi_types: List[str], limit: int = DEFAULT_RAW_POI_LIMIT
-) -> List[Dict[str, Any]]:
-    filters: List[Tuple[str, str]] = [
-        f for t in poi_types if t in TYPE_TAG_MAP for f in TYPE_TAG_MAP[t]
-    ]
-    if any(t in _LANDMARK_STYLE_TYPES for t in poi_types):
-        filters += _QUALITY_SIGNAL_FRAGMENTS
-    filters = list(dict.fromkeys(filters))  # dédoublonne en gardant l'ordre
-    if not filters:
-        filters = [("nw", '["historic"]')]
-
-    # "nw" est développé en deux groupes (node + way), syntaxe Overpass garantie
-    # standard, plutôt que de parier sur un raccourci combiné.
-    node_filters: List[str] = []
-    way_filters: List[str] = []
-    for elem_type, tag_filter in filters:
-        elem_types = ("node", "way") if elem_type == "nw" else (elem_type,)
-        for et in elem_types:
-            (node_filters if et == "node" else way_filters).append(tag_filter)
-
-    groups = [g for g in [("node", node_filters), ("way", way_filters)] if g[1]]
-
-    raw_elements_by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-        futures = [
-            executor.submit(_fetch_group, lat, lon, radius_m, et, tag_filters, limit)
-            for et, tag_filters in groups
-        ]
-        for future in futures:
-            for el in future.result():
-                # Un même élément peut être retrouvé par plusieurs filtres du même
-                # groupe (ex: un nœud avec à la fois wikidata et wikipedia) — déjà
-                # dédoublonné par le bloc "union" Overpass à l'intérieur d'un groupe,
-                # mais on sécurise ici aussi au cas où deux groupes se recoupent.
-                raw_elements_by_key[(el["type"], el["id"])] = el
+    data = _query_overpass(query)
 
     pois: List[Dict[str, Any]] = []
-    for el in raw_elements_by_key.values():
+    for el in data.get("elements", []):
         tags = el.get("tags", {})
         name = tags.get("name")
         if not name:
