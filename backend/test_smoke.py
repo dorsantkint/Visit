@@ -1,13 +1,13 @@
 """Test de fumée : vérifie que l'app démarre et que /generate-tour fonctionne de bout
 en bout, avec Overpass/Wikipedia/Groq mockés (pas de réseau dans ce sandbox).
 ranking.py et geo.py ne sont PAS mockés : pas d'appel réseau, donc on teste le vrai code."""
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app import overpass, ranking
+from app import llm_client, overpass, ranking
 from app.llm_client import CurationResult
 
 client = TestClient(app)
@@ -232,6 +232,56 @@ def test_generate_tour_includes_verified_new_landmark_from_llm():
         assert "node/1" in ids
 
 
+def test_curate_pois_still_calls_llm_when_nothing_found():
+    """Bug réel corrigé : si Overpass n'a rien trouvé du tout (candidats ET rues vides,
+    ex. zone mal cartographiée ou échec réseau), il ne faut PAS court-circuiter l'appel
+    au LLM. C'est justement le cas où la section NOUVEAUX (le LLM cite un lieu connu par
+    sa culture générale, indépendamment de ce qu'Overpass a trouvé) a le plus de valeur —
+    avant la correction, cette situation renvoyait 0 POI sans même consulter le LLM."""
+    fake_response = MagicMock()
+    fake_response.raise_for_status = lambda: None
+    fake_response.json.return_value = {
+        "choices": [{"message": {
+            "content": "INCONTOURNABLES: aucun\nSELECTION: aucun\nNOUVEAUX: Lieu Connu\nRUES: aucun"
+        }}]
+    }
+
+    with patch.dict("os.environ", {"GROQ_API_KEY": "fake-key-for-test"}), \
+         patch("app.llm_client.requests.post", return_value=fake_response) as mock_post:
+        result = llm_client.curate_pois([], 2, [], 50.8, 4.34, 500, ["monument"])
+
+        mock_post.assert_called_once()
+        assert result.new_landmark_names == ["Lieu Connu"]
+
+
+def test_generate_tour_recovers_via_llm_when_overpass_finds_nothing():
+    """Bout en bout : Overpass ne renvoie rien du tout (candidats et rues vides), mais le
+    LLM connaît un lieu par sa propre culture générale, vérifié géographiquement ensuite —
+    le résultat final ne doit pas être vide."""
+    new_poi = {
+        "osm_id": "node/777", "name": "Lieu Sauvé", "lat": 50.8002, "lon": 4.3402,
+        "category": "attraction", "osm_facts": {},
+    }
+    with patch("app.main.overpass.fetch_pois", return_value=[]), \
+         patch("app.main.overpass.fetch_street_candidates", return_value=[]), \
+         patch("app.main.overpass.fetch_neighborhood_place", return_value=None), \
+         patch("app.main.overpass.fetch_poi_by_name", return_value=new_poi), \
+         patch("app.main.wikipedia.fetch_extract_for_poi", return_value=None), \
+         patch("app.main.llm_client.generate_description", return_value="Texte."), \
+         patch(
+             "app.main.llm_client.curate_pois",
+             return_value=CurationResult(new_landmark_names=["Lieu Sauvé"]),
+         ) as mock_curate:
+
+        payload = {"lat": 50.8, "lon": 4.34, "nb_poi": 2, "languages": ["fr"], "duration_min": 1}
+        r = client.post("/generate-tour", json=payload)
+
+        assert r.status_code == 200, r.text
+        mock_curate.assert_called_once()
+        ids = {p["id"] for p in r.json()["pois"]}
+        assert "node/777" in ids, "Même sans rien trouvé par Overpass, le LLM doit pouvoir sauver la sélection"
+
+
 def test_generate_tour_uses_cache_on_second_call():
     with patch("app.main.overpass.fetch_pois", return_value=FAKE_POIS[:1]), \
          patch("app.main.overpass.fetch_street_candidates", return_value=[]), \
@@ -246,6 +296,24 @@ def test_generate_tour_uses_cache_on_second_call():
 
         assert r1.status_code == 200 and r2.status_code == 200
         assert mock_llm.call_count == 1
+
+
+if __name__ == "__main__":
+    test_health()
+    test_ranking_diversifies_categories()
+    test_split_landmarks_separates_documented_pois()
+    test_wikidata_only_is_not_an_automatic_landmark()
+    test_fetch_poi_by_name_rejects_result_outside_radius()
+    test_fetch_poi_by_name_accepts_result_inside_radius()
+    test_generate_tour_never_drops_a_landmark_even_with_many_regular_pois()
+    test_generate_tour_includes_street_and_intro()
+    test_generate_tour_works_without_street_or_neighborhood()
+    test_generate_tour_falls_back_when_curation_fails()
+    test_generate_tour_includes_verified_new_landmark_from_llm()
+    test_curate_pois_still_calls_llm_when_nothing_found()
+    test_generate_tour_recovers_via_llm_when_overpass_finds_nothing()
+    test_generate_tour_uses_cache_on_second_call()
+    print("Tous les tests sont passés.")
 
 
 if __name__ == "__main__":
