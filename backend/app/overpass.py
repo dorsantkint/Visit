@@ -89,13 +89,22 @@ RELEVANT_TAG_KEYS = [
 ]
 
 
-def _query_overpass(query: str) -> Dict[str, Any]:
+def _query_overpass(query: str, timeout: int = 35) -> Dict[str, Any]:
     """POST la requête Overpass QL, avec bascule sur un mirror de secours en cas
-    d'erreur (l'instance publique principale est parfois surchargée : 429/504)."""
+    d'erreur (l'instance publique principale est parfois surchargée : 429/504).
+
+    `timeout` est le délai HTTP maximum PAR mirror tenté (pas le total). Par défaut 35s,
+    adapté à la recherche principale de POI (fetch_pois), qui peut légitimement prendre
+    du temps sur une requête large/dense. Les fonctions secondaires (nom de quartier,
+    rues, vérification d'un lieu par nom) passent un timeout beaucoup plus court : ce
+    sont des compléments, pas le cœur de la sélection, et un mirror lent sur l'un de ces
+    appels ne doit jamais faire attendre l'utilisateur 30-50 secondes pour un simple nom
+    de quartier ou une rue en plus. Avec 3 mirrors, le pire cas reste borné à environ
+    3 × timeout + 2s de pause entre tentatives."""
     last_error: Exception = RuntimeError("Aucun mirror Overpass disponible")
     for attempt, url in enumerate(OVERPASS_URLS):
         try:
-            response = requests.post(url, data={"data": query}, timeout=35, headers=_HEADERS)
+            response = requests.post(url, data={"data": query}, timeout=timeout, headers=_HEADERS)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as exc:
@@ -104,6 +113,13 @@ def _query_overpass(query: str) -> Dict[str, Any]:
                 time.sleep(1)  # petite pause avant de basculer sur le mirror suivant
             continue
     raise last_error
+
+
+# Timeout court pour les appels Overpass "secondaires" (nom de quartier, rues,
+# vérification d'un nom proposé par le LLM) : ce sont des compléments à la visite, pas
+# le cœur de la sélection de POI, donc pas question de laisser un mirror lent faire
+# attendre l'utilisateur des dizaines de secondes pour ça.
+_SECONDARY_QUERY_TIMEOUT = 8
 
 
 # Plafond du nombre de POI bruts renvoyés par Overpass. Volontairement large et fixe
@@ -196,7 +212,7 @@ def fetch_street_candidates(
     """
 
     try:
-        data = _query_overpass(query)
+        data = _query_overpass(query, timeout=_SECONDARY_QUERY_TIMEOUT)
     except requests.RequestException:
         return []
 
@@ -241,7 +257,7 @@ def _fetch_place_name(lat: float, lon: float, place_tags: Tuple[str, ...], radiu
     out;
     """
     try:
-        data = _query_overpass(query)
+        data = _query_overpass(query, timeout=_SECONDARY_QUERY_TIMEOUT)
     except requests.RequestException:
         return None
 
@@ -292,7 +308,7 @@ def fetch_poi_by_name(name: str, lat: float, lon: float, radius_m: int) -> Optio
     out center 5;
     """
     try:
-        data = _query_overpass(query)
+        data = _query_overpass(query, timeout=_SECONDARY_QUERY_TIMEOUT)
     except requests.RequestException:
         return None
 
