@@ -266,10 +266,12 @@ def curate_pois(
     c'est au pire une réponse mal formée ou incomplète (jamais une hallucination de
     coordonnées) — géré par l'appelant qui complète avec le classement algorithmique si
     la réponse est insuffisante.
-    """
-    if not candidates and not street_candidates:
-        return CurationResult()
 
+    Volontairement PAS de sortie anticipée quand candidates/street_candidates sont vides :
+    c'est justement le cas où la section NOUVEAUX (le LLM cite un lieu connu qu'Overpass
+    n'a pas trouvé du tout) a le plus de valeur — Overpass a pu échouer ou simplement ne
+    rien couvrir dans cette zone précise pour les thèmes demandés.
+    """
     prompt = _build_curation_prompt(candidates, nb_poi, street_candidates, lat, lon, radius_m, poi_types)
 
     response = requests.post(
