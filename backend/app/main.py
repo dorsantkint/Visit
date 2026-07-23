@@ -1,6 +1,7 @@
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI
@@ -25,6 +26,18 @@ _OSM_TAG_LABELS = {
 # (souvent 10-40m) serait trop étroit pour se déclencher de façon fiable en marchant.
 STREET_POI_MIN_TRIGGER_RADIUS_M = 100
 
+# Nombre max de descriptions générées EN PARALLÈLE (POI + rues + quartier confondus).
+# Plafonné volontairement : Groq (offre gratuite) limite à 30 requêtes/minute toutes
+# requêtes confondues (curation + descriptions) — un plafond trop haut risquerait de
+# déclencher des erreurs 429 plutôt que d'accélérer encore.
+MAX_PARALLEL_DESCRIPTIONS = 8
+
+
+def _log_timing(label: str, started_at: float) -> None:
+    """Affiche le temps écoulé pour une étape dans la console où tourne uvicorn — sert à
+    voir soi-même où passe le temps sur une requête réelle, plutôt que de deviner."""
+    print(f"[timing] {label} : {time.perf_counter() - started_at:.2f}s")
+
 
 def _describe_osm_tags(osm_tags: Dict[str, str]) -> Optional[str]:
     lines = [
@@ -40,7 +53,11 @@ def _fetch_pageviews_for_landmarks(landmarks: List[Dict], primary_lang: str) -> 
     incontournable, en parallèle. Utilisé à la fois pour les incontournables "heritage"
     et pour ceux reconnus/proposés par le LLM (voir generate_tour) : dans les deux cas,
     on ne se fie pas au jugement du modèle pour l'ORDRE de priorité entre eux, seulement
-    pour l'identification — le tri final se fait sur un vrai signal de popularité."""
+    pour l'identification — le tri final se fait sur un vrai signal de popularité.
+
+    Coûteux en réseau (Wikidata + Wikimedia par landmark) : l'appelant ne déclenche ceci
+    que quand c'est vraiment nécessaire pour départager (voir les deux appels dans
+    generate_tour), jamais systématiquement."""
     pageviews: Dict[str, int] = {}
     if not landmarks:
         return pageviews
@@ -117,6 +134,39 @@ def _get_or_generate_description(
     return text
 
 
+def _generate_all_descriptions(
+    jobs: List[Tuple[str, str, str, Dict[str, str], float, float, str]], duration_min: int
+) -> Dict[Tuple[str, str], str]:
+    """Génère TOUTES les descriptions (POI + rues + quartier) en parallèle plutôt qu'une
+    par une. C'est le principal levier de vitesse : chaque description est un appel Groq
+    indépendant (le cache est déjà vérifié avant l'appel), donc les lancer en parallèle ne
+    change rien à la qualité, juste au temps d'attente total.
+
+    Une description qui échoue (panne réseau, clé API manquante, limite de débit Groq
+    atteinte) ne fait pas échouer toute la visite : elle est remplacée par un texte de
+    repli, plutôt que de faire planter toute la requête pour un seul POI en panne.
+    """
+    results: Dict[Tuple[str, str], str] = {}
+    if not jobs:
+        return results
+
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_DESCRIPTIONS, len(jobs))) as executor:
+        futures = {
+            executor.submit(
+                _get_or_generate_description, cache_key, name, category, osm_facts, lat, lon, lang, duration_min
+            ): (cache_key, lang)
+            for cache_key, name, category, osm_facts, lat, lon, lang in jobs
+        }
+        for future, key in futures.items():
+            try:
+                results[key] = future.result()
+            except Exception:
+                cache_key, lang = key
+                results[key] = "Description indisponible pour ce lieu pour le moment."
+
+    return results
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cache.init_db()
@@ -141,10 +191,11 @@ def health() -> dict:
 
 @app.post("/generate-tour", response_model=TourResponse)
 def generate_tour(req: TourRequest) -> TourResponse:
+    request_started_at = time.perf_counter()
+
     # Ces 3 appels réseau sont indépendants entre eux (POI classiques, rues, quartier) :
-    # on les lance en parallèle plutôt que les uns après les autres. Ça ne change rien
-    # aux générations IA qui suivent (toujours séquentielles sur ce modèle), mais évite
-    # d'attendre inutilement sur les appels Overpass.
+    # on les lance en parallèle plutôt que les uns après les autres.
+    stage_started_at = time.perf_counter()
     with ThreadPoolExecutor(max_workers=3) as executor:
         raw_pois_future = executor.submit(
             overpass.fetch_pois, req.lat, req.lon, req.radius_m, req.poi_types
@@ -168,15 +219,20 @@ def generate_tour(req: TourRequest) -> TourResponse:
             neighborhood_name = neighborhood_future.result()
         except requests.RequestException:
             neighborhood_name = None
+    _log_timing(f"1/4 Overpass (fetch_pois={len(raw_pois)} POI)", stage_started_at)
 
     # --- POI "attraction" classiques (monuments, musées, etc.) ---
     # Étape 0 : les incontournables "heritage" (statut patrimonial officiel, tag posé par
     # un contributeur OSM) sont toujours inclus en priorité, jamais soumis au tri de
     # diversité ni à la curation IA — un fait officiel reste un fait officiel, indépendant
     # de ce que le LLM aura pensé à reconnaître ou non.
+    stage_started_at = time.perf_counter()
     landmarks, regular_candidates = ranking.split_landmarks(raw_pois)
 
     primary_lang = req.languages[0] if req.languages else "fr"
+    # Les vues Wikipedia ne servent qu'à départager quand il y a plus d'incontournables
+    # "heritage" que de places disponibles — inutile d'appeler l'API sinon (ils seront
+    # de toute façon tous inclus, peu importe l'ordre).
     pageviews_heritage = (
         _fetch_pageviews_for_landmarks(landmarks, primary_lang) if len(landmarks) > req.nb_poi else {}
     )
@@ -223,12 +279,19 @@ def generate_tour(req: TourRequest) -> TourResponse:
 
         # Les incontournables reconnus dans le vivier + les nouveaux vérifiés forment un
         # même groupe, trié ENTRE EUX par vraies vues Wikipedia (pas par l'ordre dans
-        # lequel le LLM les a cités) — priorisé avant le reste de la sélection.
+        # lequel le LLM les a cités) — priorisé avant le reste de la sélection. Même
+        # logique d'économie que pour le tier "heritage" plus haut : si tous tiennent de
+        # toute façon dans les places restantes, l'ordre exact ne changera rien au
+        # résultat final, donc pas besoin d'appeler Wikipedia pour ça.
         llm_landmark_ids = {i for i in curation.recognized_ids if i in by_id} | {
             p["osm_id"] for p in verified_new
         }
         llm_landmarks = [by_id[i] for i in llm_landmark_ids]
-        pageviews_llm = _fetch_pageviews_for_landmarks(llm_landmarks, primary_lang) if llm_landmarks else {}
+        pageviews_llm = (
+            _fetch_pageviews_for_landmarks(llm_landmarks, primary_lang)
+            if len(llm_landmarks) > remaining_slots
+            else {}
+        )
         prioritized_llm_landmarks = ranking.rank_landmarks(llm_landmarks, req.lat, req.lon, pageviews_llm)
 
         for poi in prioritized_llm_landmarks:
@@ -254,17 +317,39 @@ def generate_tour(req: TourRequest) -> TourResponse:
 
         street_by_id = {s["osm_id"]: s for s in street_candidates}
         chosen_streets = [street_by_id[i] for i in curation.street_ids if i in street_by_id]
+    _log_timing(f"2/4 Sélection + curation IA ({len(selected)} POI, {len(chosen_streets)} rue(s))", stage_started_at)
 
+    # --- Toutes les descriptions (POI + rues + quartier) sont générées EN PARALLÈLE ---
+    # C'est ici que passait le plus de temps avant : un appel Groq par POI par langue,
+    # les uns après les autres. Ce sont des appels indépendants vers une API cloud (pas
+    # un modèle local à créneau unique), donc les paralléliser ne change rien à la
+    # qualité, juste au temps d'attente total.
+    stage_started_at = time.perf_counter()
+    description_jobs: List[Tuple[str, str, str, Dict[str, str], float, float, str]] = []
+    for poi in selected:
+        for lang in req.languages:
+            description_jobs.append(
+                (poi["osm_id"], poi["name"], poi["category"], poi.get("osm_facts", {}), poi["lat"], poi["lon"], lang)
+            )
+    for street in chosen_streets:
+        for lang in req.languages:
+            description_jobs.append(
+                (street["osm_id"], street["name"], "rue", street.get("osm_facts", {}), street["lat"], street["lon"], lang)
+            )
+    if neighborhood_name:
+        for lang in req.languages:
+            description_jobs.append(
+                (f"neighborhood/{neighborhood_name}", neighborhood_name, "quartier", {}, req.lat, req.lon, lang)
+            )
+
+    description_results = _generate_all_descriptions(description_jobs, req.duration_min)
+    _log_timing(f"3/4 Descriptions ({len(description_jobs)} appels)", stage_started_at)
+
+    stage_started_at = time.perf_counter()
     result_pois: List[PoiOut] = []
     for poi in selected:
         descriptions = [
-            PoiDescription(
-                language=lang,
-                text=_get_or_generate_description(
-                    poi["osm_id"], poi["name"], poi["category"], poi.get("osm_facts", {}),
-                    poi["lat"], poi["lon"], lang, req.duration_min,
-                ),
-            )
+            PoiDescription(language=lang, text=description_results[(poi["osm_id"], lang)])
             for lang in req.languages
         ]
         result_pois.append(
@@ -284,13 +369,7 @@ def generate_tour(req: TourRequest) -> TourResponse:
     # elles ne consomment pas le budget nb_poi, comme avant.)
     for street in chosen_streets:
         descriptions = [
-            PoiDescription(
-                language=lang,
-                text=_get_or_generate_description(
-                    street["osm_id"], street["name"], "rue", street.get("osm_facts", {}),
-                    street["lat"], street["lon"], lang, req.duration_min,
-                ),
-            )
+            PoiDescription(language=lang, text=description_results[(street["osm_id"], lang)])
             for lang in req.languages
         ]
         result_pois.append(
@@ -306,18 +385,13 @@ def generate_tour(req: TourRequest) -> TourResponse:
         )
 
     # --- Anecdote de quartier : PAS géofencée, livrée une fois au lancement ---
-    # (neighborhood_name déjà résolu en parallèle plus haut, via Overpass)
     intro: List[PoiDescription] = []
     if neighborhood_name:
         intro = [
-            PoiDescription(
-                language=lang,
-                text=_get_or_generate_description(
-                    f"neighborhood/{neighborhood_name}", neighborhood_name, "quartier", {},
-                    req.lat, req.lon, lang, req.duration_min,
-                ),
-            )
+            PoiDescription(language=lang, text=description_results[(f"neighborhood/{neighborhood_name}", lang)])
             for lang in req.languages
         ]
+    _log_timing("4/4 Assemblage réponse", stage_started_at)
+    _log_timing("TOTAL requête", request_started_at)
 
     return TourResponse(intro=intro, pois=result_pois)
